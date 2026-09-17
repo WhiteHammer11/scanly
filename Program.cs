@@ -54,10 +54,10 @@ app.MapGet("/health", () => new { status = "ok", mode = azureMode ? "azure" : "d
    .WithTags("Status").Produces<object>(200);
 
 // ── POST /invoices ───────────────────────────────────────────────
-app.MapPost("/invoices", async (HttpRequest req) =>
+app.MapPost("/invoices", async (IFormFile file) =>
 {
-    if (!req.HasFormContentType || req.Form.Files.Count == 0)
-        return Results.BadRequest(new { fel = "Skicka filen som multipart/form-data (fält: file)" });
+    if (file is null || file.Length == 0)
+        return Results.BadRequest(new { fel = "Skicka en PDF- eller bildfil." });
 
     var id = Guid.NewGuid().ToString("N")[..8];
     FakturaResultat r;
@@ -69,18 +69,30 @@ app.MapPost("/invoices", async (HttpRequest req) =>
     }
     else
     {
-        using var stream = req.Form.Files[0].OpenReadStream();
-        var op = await diClient.AnalyzeDocumentAsync(WaitUntil.Completed, "prebuilt-invoice", stream);
+        using var stream = file.OpenReadStream();
+
+        var op = await diClient.AnalyzeDocumentAsync(
+            WaitUntil.Completed,
+            "prebuilt-invoice",
+            stream);
+
         var doc = op.Value.Documents.FirstOrDefault();
         r = ParseFaktura(doc, id);
-        await blobs!.UploadBlobAsync($"{id}.json", new BinaryData(JsonSerializer.Serialize(r)));
+
+        await blobs!.UploadBlobAsync(
+            $"{id}.json",
+            new BinaryData(JsonSerializer.Serialize(r)));
     }
 
     fakturor[id] = r;
+
     return Results.Created($"/invoices/{id}", new { id, r.Status });
 })
-.WithTags("Fakturor").WithSummary("Ladda upp faktura (PDF/bild) för Document Intelligence-analys")
-.Produces<object>(201).Produces(400).DisableAntiforgery();
+.WithTags("Fakturor")
+.WithSummary("Ladda upp faktura (PDF/bild) för Document Intelligence-analys")
+.Produces<object>(201)
+.Produces(400)
+.DisableAntiforgery();
 
 // ── GET /invoices/{id} ───────────────────────────────────────────
 app.MapGet("/invoices/{id}", async (string id) =>
