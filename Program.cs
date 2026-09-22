@@ -23,7 +23,7 @@ using System.Text.Json;
 
 var diEndpoint = Environment.GetEnvironmentVariable("AZURE_DI_ENDPOINT");
 var diKey = Environment.GetEnvironmentVariable("AZURE_DI_KEY");
-var storageUrl = Environment.GetEnvironmentVariable("https://scanlyavdija2026.blob.core.windows.net/");
+var storageUrl = Environment.GetEnvironmentVariable("AZURE_STORAGE_URL");
 var azureMode = diEndpoint is not null && storageUrl is not null;
 
 var builder = WebApplication.CreateBuilder(args);
