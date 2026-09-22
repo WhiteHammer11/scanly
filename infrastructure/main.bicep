@@ -1,4 +1,5 @@
 param storageAccountName string
+param acrName string
 
 resource storageAccount 'Microsoft.Storage/storageAccounts@2023-05-01' = {
   name: storageAccountName
@@ -17,6 +18,23 @@ resource invoicesContainer 'Microsoft.Storage/storageAccounts/blobServices/conta
   properties: {
     publicAccess: 'None'
   }
+}
+
+resource acr 'Microsoft.ContainerRegistry/registries@2023-07-01' = {
+  name: acrName
+  location: resourceGroup().location
+  sku: {
+    name: 'Basic'
+  }
+  properties: {
+    adminUserEnabled: false
+  }
+}
+
+resource containerAppsEnvironment 'Microsoft.App/managedEnvironments@2024-03-01' = {
+  name: 'scanly-env'
+  location: resourceGroup().location
+  properties: {}
 }
 
 output storageUrl string = 'https://${storageAccount.name}.${environment().suffixes.storage}/'
