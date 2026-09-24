@@ -77,6 +77,24 @@ app.MapPost("/invoices", async (IFormFile file) =>
             stream);
 
         var doc = op.Value.Documents.FirstOrDefault();
+        if (doc != null)
+        {
+            foreach (var field in doc.Fields)
+            {
+                Console.WriteLine(
+                    $"{field.Key} | Content: {field.Value.Content}");
+
+                if (field.Key == "Items" && field.Value.Value != null)
+                {
+                    Console.WriteLine("=== ITEMS ===");
+
+                    foreach (var item in field.Value.Value.AsList())
+                    {
+                        Console.WriteLine(item.Content);
+                    }
+                }
+            }
+        }
         r = ParseFaktura(doc, id);
 
         await blobs!.UploadBlobAsync(
@@ -123,11 +141,36 @@ app.Run();
 // Lokal funktion måste ligga FÖRE record-deklarationen i top-level context
 static FakturaResultat ParseFaktura(AnalyzedDocument? doc, string id)
 {
-    if (doc is null) return new(id, "Okänd", 0m, "", "SEK", "fel: tomt svar");
-    string Get(string k) => doc.Fields.TryGetValue(k, out var f) ? f.Content ?? "" : "";
-    decimal GetDec(string k) => doc.Fields.TryGetValue(k, out var f) &&
-                                 f.Value?.AsDouble() is double d ? (decimal)d : 0m;
-    return new(id, Get("VendorName"), GetDec("InvoiceTotal"), Get("DueDate"), "SEK", "klar");
+    if (doc is null)
+        return new(id, "Okänd", 0m, "", "SEK", "fel: tomt svar");
+
+    string Get(string k) =>
+        doc.Fields.TryGetValue(k, out var f)
+            ? f.Content ?? ""
+            : "";
+
+    decimal GetDec(string k)
+    {
+        if (!doc.Fields.TryGetValue(k, out var f) || f.Value is null)
+            return 0m;
+
+        try
+        {
+            return (decimal)f.Value.AsCurrency().Amount;
+        }
+        catch
+        {
+            return 0m;
+        }
+    }
+
+    return new(
+        id,
+        Get("VendorName"),
+        GetDec("InvoiceTotal"),
+        Get("DueDate"),
+        "SEK",
+        "klar");
 }
 
 // ── Modeller ─────────────────────────────────────────────────────
