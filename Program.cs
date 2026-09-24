@@ -32,6 +32,7 @@ builder.Services.AddSwaggerGen(o => o.SwaggerDoc("v1", new() { Title = "Scanly A
 var app = builder.Build();
 app.UseSwagger();
 app.UseSwaggerUI();
+var logger = app.Logger;
 
 // Azure-klienter — aktiveras automatiskt när miljövariablerna är satta
 DocumentAnalysisClient? diClient = null;
@@ -57,50 +58,86 @@ app.MapGet("/health", () => new { status = "ok", mode = azureMode ? "azure" : "d
 app.MapPost("/invoices", async (IFormFile file) =>
 {
     if (file is null || file.Length == 0)
+    {
+        logger.LogWarning("En tom eller ogiltig fil skickades till /invoices");
         return Results.BadRequest(new { fel = "Skicka en PDF- eller bildfil." });
 
+    }
+
     var id = Guid.NewGuid().ToString("N")[..8];
+
+    logger.LogInformation(
+        "Börjar behandla faktura {InvoiceId}. Fil: {FileName}, Storlek: {FileSize} bytes",
+        id,
+        file.FileName,
+        file.Length);
+
+
     FakturaResultat r;
 
     if (!azureMode || diClient is null)
     {
         r = new(id, "Demo Leverantör AB", 12500m,
-            DateTime.UtcNow.AddDays(30).ToString("yyyy-MM-dd"), "SEK", "klar (demo-läge)");
+            DateTime.UtcNow.AddDays(30).ToString("yyyy-MM-dd"), "SEK", "klar (demo-läge)", new List<Radpost>());
     }
     else
     {
-        using var stream = file.OpenReadStream();
-
-        var op = await diClient.AnalyzeDocumentAsync(
-            WaitUntil.Completed,
-            "prebuilt-invoice",
-            stream);
-
-        var doc = op.Value.Documents.FirstOrDefault();
-        if (doc != null)
+        try
         {
-            foreach (var field in doc.Fields)
-            {
-                Console.WriteLine(
-                    $"{field.Key} | Content: {field.Value.Content}");
+            using var stream = file.OpenReadStream();
 
-                if (field.Key == "Items" && field.Value.Value != null)
-                {
-                    Console.WriteLine("=== ITEMS ===");
+            logger.LogInformation(
+                "Startar Document Intelligence-analys för faktura {InvoiceId}",
+                id);
 
-                    foreach (var item in field.Value.Value.AsList())
-                    {
-                        Console.WriteLine(item.Content);
-                    }
-                }
-            }
+            var op = await diClient.AnalyzeDocumentAsync(
+                WaitUntil.Completed,
+                "prebuilt-invoice",
+                stream);
+
+            var doc = op.Value.Documents.FirstOrDefault();
+
+            logger.LogInformation(
+                "Document Intelligence-analys klar för faktura {InvoiceId}",
+                id);
+
+            r = ParseFaktura(doc, id);
+
+            await blobs!.UploadBlobAsync(
+                $"{id}.json",
+                new BinaryData(JsonSerializer.Serialize(r)));
+
+            logger.LogInformation(
+                "Analysresultat för faktura {InvoiceId} sparat i Blob Storage",
+                id);
         }
-        r = ParseFaktura(doc, id);
+        catch (RequestFailedException ex)
+        {
+            logger.LogError(
+                ex,
+                "Azure-fel vid behandling av faktura {InvoiceId}. Statuskod: {StatusCode}",
+                id,
+                ex.Status);
 
-        await blobs!.UploadBlobAsync(
-            $"{id}.json",
-            new BinaryData(JsonSerializer.Serialize(r)));
+            return Results.Problem(
+                title: "Kunde inte behandla fakturan",
+                detail: "Filen kunde inte analyseras av Document Intelligence. Kontrollera att filtypen stöds och att filen inte är lösenordsskyddad.",
+                statusCode: StatusCodes.Status400BadRequest);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(
+                ex,
+                "Oväntat fel vid behandling av faktura {InvoiceId}",
+                id);
+
+            return Results.Problem(
+                title: "Internt serverfel",
+                detail: "Fakturan kunde inte behandlas.",
+                statusCode: StatusCodes.Status500InternalServerError);
+        }
     }
+
 
     fakturor[id] = r;
 
@@ -142,7 +179,7 @@ app.Run();
 static FakturaResultat ParseFaktura(AnalyzedDocument? doc, string id)
 {
     if (doc is null)
-        return new(id, "Okänd", 0m, "", "SEK", "fel: tomt svar");
+        return new(id, "Okänd", 0m, "", "SEK", "fel: tomt svar", new List<Radpost>());
 
     string Get(string k) =>
         doc.Fields.TryGetValue(k, out var f)
@@ -164,15 +201,87 @@ static FakturaResultat ParseFaktura(AnalyzedDocument? doc, string id)
         }
     }
 
+    List<Radpost> GetRadposter()
+    {
+        var radposter = new List<Radpost>();
+
+        if (!doc.Fields.TryGetValue("Items", out var itemsField) ||
+            itemsField.Value is null)
+        {
+            return radposter;
+        }
+
+        foreach (var item in itemsField.Value.AsList())
+        {
+            var itemObject = item.Value.AsDictionary();
+
+            string GetItemString(string key)
+            {
+                return itemObject.TryGetValue(key, out var field)
+                    ? field.Content ?? ""
+                    : "";
+            }
+
+            decimal GetItemDecimal(string key)
+            {
+                if (!itemObject.TryGetValue(key, out var field) ||
+                    field.Value is null)
+                {
+                    return 0m;
+                }
+
+                try
+                {
+                    if (field.Value.AsCurrency() is { } currency)
+                        return (decimal)currency.Amount;
+                }
+                catch
+                {
+                    // Not a Currency field
+                }
+
+                try
+                {
+                    return (decimal)field.Value.AsDouble();
+                }
+                catch
+                {
+                    return 0m;
+                }
+            }
+
+            radposter.Add(new Radpost(
+                GetItemString("Description"),
+                GetItemDecimal("Quantity"),
+                GetItemDecimal("UnitPrice"),
+                GetItemDecimal("Amount")));
+        }
+
+        return radposter;
+    }
+
     return new(
         id,
         Get("VendorName"),
         GetDec("InvoiceTotal"),
         Get("DueDate"),
         "SEK",
-        "klar");
+        "klar",
+        GetRadposter());
 }
 
 // ── Modeller ─────────────────────────────────────────────────────
-record FakturaResultat(string Id, string Leverantor, decimal Totalbelopp,
-    string Forfallodatum, string Valuta, string Status);
+record FakturaResultat(
+    string Id,
+    string Leverantor,
+    decimal Totalbelopp,
+    string Forfallodatum,
+    string Valuta,
+    string Status,
+    List<Radpost> Radposter);
+
+record Radpost(
+    string Beskrivning,
+    decimal Antal,
+    decimal Enhetspris,
+    decimal Belopp);
