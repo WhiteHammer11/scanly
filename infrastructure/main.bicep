@@ -1,6 +1,7 @@
-
 param storageAccountName string
 param acrName string
+param documentIntelligenceEndpoint string
+
 
 resource storageAccount 'Microsoft.Storage/storageAccounts@2023-05-01' = {
   name: storageAccountName
@@ -69,6 +70,18 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
         {
           name: 'scanly-api'
           image: '${acr.name}.azurecr.io/scanly-api:latest'
+
+          env: [
+            {
+              name: 'AZURE_DI_ENDPOINT'
+              value: documentIntelligenceEndpoint
+            }
+            {
+              name: 'AZURE_STORAGE_URL'
+              value: 'https://${storageAccount.name}.${environment().suffixes.storage}/'
+            }
+          ]
+
           resources: {
             cpu: 1
             memory: '2Gi'
@@ -122,3 +135,4 @@ resource storageBlobDataContributorRoleAssignment 'Microsoft.Authorization/roleA
 }
 
 output storageUrl string = 'https://${storageAccount.name}.${environment().suffixes.storage}/'
+output containerAppName string = containerApp.name
