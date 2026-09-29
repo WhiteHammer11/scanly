@@ -39,11 +39,17 @@ DocumentAnalysisClient? diClient = null;
 BlobContainerClient? blobs = null;
 if (azureMode)
 {
-    var storageCred = new DefaultAzureCredential();
-    diClient = diKey is not null
-        ? new DocumentAnalysisClient(new Uri(diEndpoint!), new AzureKeyCredential(diKey))
-        : new DocumentAnalysisClient(new Uri(diEndpoint!), storageCred);
-    blobs = new BlobServiceClient(new Uri(storageUrl!), storageCred).GetBlobContainerClient("invoices");
+    var azureCredential = new DefaultAzureCredential();
+
+    diClient = new DocumentAnalysisClient(
+        new Uri(diEndpoint!),
+        azureCredential);
+
+    blobs = new BlobServiceClient(
+        new Uri(storageUrl!),
+        azureCredential)
+        .GetBlobContainerClient("invoices");
+
     await blobs.CreateIfNotExistsAsync();
 }
 
