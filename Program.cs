@@ -22,7 +22,6 @@ using Azure.Storage.Blobs;
 using System.Text.Json;
 
 var diEndpoint = Environment.GetEnvironmentVariable("AZURE_DI_ENDPOINT");
-var diKey = Environment.GetEnvironmentVariable("AZURE_DI_KEY");
 var storageUrl = Environment.GetEnvironmentVariable("AZURE_STORAGE_URL");
 var azureMode = diEndpoint is not null && storageUrl is not null;
 
@@ -291,3 +290,4 @@ record Radpost(
     decimal Antal,
     decimal Enhetspris,
     decimal Belopp);
+public partial class Program { }
