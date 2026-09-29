@@ -37,7 +37,7 @@ jobs:
         run: dotnet build Scanly-AB.csproj -c Release --no-restore
 
       - name: Test
-        run: dotnet test Scanly-AB.csproj -c Release --no-build
+        run: dotnet test Scanly.Tests/Scanly.Tests.csproj -c Release
 
       - name: Login to Azure
         uses: azure/login@v2
