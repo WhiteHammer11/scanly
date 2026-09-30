@@ -2,255 +2,183 @@
 
 ## 1. Översikt
 
-Scanly AB är en molnbaserad applikation för automatisk behandling av fakturor.
+Scanly AB är en molnbaserad lösning för automatisk behandling av fakturor. Lösningen består av ett .NET 8 REST API som körs i Azure Container Apps. En klient laddar upp en faktura som PDF eller bild till API:t, som skickar dokumentet till Azure Document Intelligence med modellen `prebuilt-invoice` och omvandlar resultatet till ett strukturerat fakturaformat.
 
-Lösningen består av ett .NET 8 REST API som körs i Azure Container Apps. Användaren skickar in en faktura som PDF via API:t. API:t skickar fakturan till Azure Document Intelligence för analys och sparar sedan resultatet som JSON i Azure Blob Storage.
-
-Projektet använder GitHub Actions för CI/CD och Azure Container Registry för lagring av containerimages. Azure-infrastrukturen beskrivs med Bicep som Infrastructure as Code.
+Det strukturerade resultatet sparas som JSON i Azure Blob Storage. Docker-images lagras i Azure Container Registry (ACR), GitHub Actions hanterar CI/CD och Azure-infrastrukturen beskrivs med Bicep som Infrastructure as Code.
 
 ## 2. Arkitekturdiagram
 
 ```mermaid
 flowchart LR
-
     Client[Klient]
-
     API[Azure Container Apps<br/>Scanly REST API<br/>.NET 8]
-
     DI[Azure Document Intelligence<br/>prebuilt-invoice]
-
     Blob[Azure Blob Storage<br/>invoices]
-
     ACR[Azure Container Registry]
-
     GitHub[GitHub Repository]
-
     Actions[GitHub Actions<br/>CI/CD]
-
     Bicep[Bicep<br/>Infrastructure as Code]
+    Azure[Azure-resurser]
 
     Client -->|HTTPS / POST /invoices| API
 
     API -->|1. Skickar faktura| DI
-    DI -->|2. Strukturerat fakturaresultat| API
-
+    DI -->|2. Strukturerat resultat| API
     API -->|3. Sparar JSON| Blob
 
     GitHub -->|push main| Actions
-    Actions -->|build + push| ACR
-    Actions -->|deploy| API
+    Actions -->|build + test + push| ACR
+    Actions -->|deploy + verify health| API
 
     ACR -->|Container image| API
 
-    Bicep -->|Provisionerar| Azure[Azure-resurser]
-
+    Bicep -->|Provisionerar| Azure
     Azure --> ACR
     Azure --> Blob
     Azure --> API
 
     API -.->|Managed Identity + RBAC| Blob
     API -.->|Managed Identity + AcrPull| ACR
+    API -.->|AZURE_DI_KEY om satt,<br/>annars DefaultAzureCredential| DI
+```
 
-    API -.->|AZURE_DI_KEY<br/>Container Apps Secret| DI
+## 3. API och fakturaflöde
 
-    ## 3. API och fakturaflöde
-
-Scanly använder ett .NET 8 REST API som körs i Azure Container Apps.
-
-API:t har följande endpoints:
+Scanly använder ett .NET 8 Minimal API som körs i Azure Container Apps. API:t exponerar Swagger UI på `/swagger` och innehåller följande endpoints:
 
 - `GET /health` – kontrollerar att API:t är tillgängligt.
-- `POST /invoices` – tar emot en faktura som PDF, analyserar den och sparar resultatet.
+- `POST /invoices` – tar emot en faktura som PDF eller bild, analyserar den och sparar resultatet.
 - `GET /invoices/{id}` – hämtar resultatet för en specifik faktura.
-- `GET /invoices` – listar lagrade fakturor.
+- `GET /invoices` – listar lagrade faktura-ID:n.
 
 ### Flöde för en faktura
 
-1. Klienten skickar en PDF-faktura till `POST /invoices`.
-2. API:t skickar PDF-filen till Azure Document Intelligence.
-3. Document Intelligence använder modellen `prebuilt-invoice` för att identifiera information från fakturan.
-4. API:t omvandlar resultatet till Scanlys strukturerade fakturaformat.
+1. Klienten skickar en PDF eller bild till `POST /invoices`.
+2. API:t skapar ett faktura-ID och skickar dokumentet till Azure Document Intelligence.
+3. Modellen `prebuilt-invoice` används för att analysera dokumentet.
+4. API:t plockar ut bland annat leverantör, totalbelopp, förfallodatum och radposter.
 5. Resultatet serialiseras till JSON.
 6. JSON-filen sparas i Azure Blob Storage i containern `invoices`.
-7. API:t returnerar ett svar till klienten med fakturans ID och status.
-
-Ett lyckat anrop returnerar HTTP-status `201 Created` och statusen `klar`.
-
-### Dokumentation och testning
-
-API:t exponerar Swagger UI för att göra det möjligt att testa endpoints och se API-kontraktet.
-
-Swagger används bland annat för att testa fakturaflödet genom att ladda upp en PDF till `POST /invoices`.
+7. API:t returnerar HTTP `201 Created` med fakturans ID och status.
+8. Resultatet kan därefter hämtas via `GET /invoices/{id}`.
 
 ## 4. Azure-resurser
 
 ### Azure Container Apps
 
-Scanly API körs som en container i Azure Container Apps.
-
-Container Appen ansvarar för att köra API:t och göra det tillgängligt via HTTPS. Applikationen är konfigurerad med extern ingress och körs på port 8080.
-
-Container Appen är konfigurerad med minst 2 repliker för att uppfylla kravet på tillgänglighet och kan skala upp vid högre belastning.
+Scanly API körs i Azure Container Apps med extern ingress på port 8080. Applikationen är konfigurerad med 1 vCPU och 2 GiB minne per replik. Bicep-konfigurationen anger minst 2 repliker och högst 5 repliker. HTTP-baserad autoskalning används med ett tröskelvärde på 10 samtidiga requests.
 
 ### Azure Container Registry
 
-Azure Container Registry (ACR) används för att lagra Docker-imagen för Scanly API.
-
-GitHub Actions bygger Docker-imagen och pushar den till ACR. Container Appen hämtar sedan imagen från registret vid deployment.
-
-Container Appens Managed Identity har rollen `AcrPull` för att kunna hämta containerimagen utan att använda hårdkodade credentials.
+Azure Container Registry används som privat register för Scanlys Docker-images. GitHub Actions bygger imagen och pushar både en SHA-baserad tagg och `latest`. Container Appens System Assigned Managed Identity har rollen `AcrPull`, vilket gör att Container Apps kan hämta images från ACR utan hårdkodade registry-credentials.
 
 ### Azure Blob Storage
 
-Azure Blob Storage används för att lagra det strukturerade JSON-resultatet från fakturaanalysen.
-
-Containern `invoices` används för fakturorna.
-
-API:t använder Managed Identity för åtkomst till Blob Storage. Container Appens Managed Identity har rollen `Storage Blob Data Contributor`.
-
-Det innebär att API:t kan skriva fakturornas JSON-resultat till Storage utan att en Storage Account Key behöver ligga i applikationen.
+Azure Blob Storage används för att lagra ett strukturerat JSON-resultat per faktura-ID i den privata containern `invoices`. Storage Account använder `Standard_LRS` och Hot access tier. Container Appens Managed Identity har rollen `Storage Blob Data Contributor` och används av applikationen via `DefaultAzureCredential`.
 
 ### Azure Document Intelligence
 
-Azure Document Intelligence används för att analysera fakturornas innehåll.
+Azure Document Intelligence används för fakturaanalys med modellen `prebuilt-invoice`. I nuvarande implementation läser API:t `AZURE_DI_ENDPOINT` och använder `AZURE_DI_KEY` om den variabeln finns; annars används `DefaultAzureCredential`. Detta gör att implementationen kan fungera både med en delad kursresurs som kräver API-key och med Managed Identity när resurs och identitet finns i en kompatibel tenant.
 
-API:t använder modellen `prebuilt-invoice` för att identifiera information från PDF-fakturor, exempelvis fakturanummer, datum, leverantör och belopp.
-
-Document Intelligence-resursen är en delad Azure-resurs som ligger i en annan tenant. Därför används API-key-baserad autentisering istället för Managed Identity.
-
-API-nyckeln lagras som en Azure Container Apps Secret och exponeras för applikationen genom miljövariabeln `AZURE_DI_KEY`.
-
-Endpointen konfigureras genom `AZURE_DI_ENDPOINT`.
-
-### Azure Managed Identity
-
-Container Appen använder en System Assigned Managed Identity.
-
-Managed Identity används för åtkomst till våra Azure-resurser där det är möjligt, framför allt:
-
-- Azure Blob Storage
-- Azure Container Registry
-
-Det minskar behovet av att lagra credentials direkt i applikationskoden.
+För kursens delade Document Intelligence-resurs har tenant-begränsningen varit ett praktiskt hinder för Managed Identity. API-key ska därför, när den används, ligga i en säker Azure-konfiguration och aldrig i källkod eller Git-historik. Ett långsiktigt produktionsmål är att använda Managed Identity även mot Document Intelligence när resursen ligger i rätt tenant och RBAC kan konfigureras.
 
 ## 5. Infrastructure as Code
 
-Azure-infrastrukturen beskrivs med Bicep.
+Azure-infrastrukturen beskrivs i `infrastructure/main.bicep`. Mallen definierar bland annat Storage Account, privat Blob-container, ACR, Container Apps Environment, Container App, System Assigned Managed Identity, RBAC-rolltilldelningar och autoskalning.
 
-Huvudfilen är:
+Mallen har parametrar för Storage Account-namn, ACR-namn och Document Intelligence-endpoint. Det finns även dev- och prod-parameterfiler. I nuvarande `main` innehåller parameterfilerna resursnamnen för respektive miljö; Document Intelligence-endpointen behöver därför tillföras vid deployment eller kompletteras i parameterfilen innan en fullständig parameterstyrd deployment.
 
-`infrastructure/main.bicep`
+Bicep-filerna har validerats med Azure CLI och `az deployment group what-if` har använts för att kontrollera planerade förändringar före deployment.
 
-Det finns även separata parameterfiler för olika miljöer:
+## 6. Säkerhet och identitet
 
-- `infrastructure/dev.bicepparam`
-- `infrastructure/prod.bicepparam`
+Container Appen använder en System Assigned Managed Identity. Identiteten används för åtkomst till ACR och Blob Storage genom RBAC i stället för lagrade användarnamn, lösenord eller Storage Account Keys.
 
-Bicep används för att beskriva och parametrera Azure-resurser istället för att all infrastruktur behöver skapas manuellt.
+GitHub Actions autentiserar mot Azure med OIDC och federerad identitet. Workflowet använder `AZURE_CLIENT_ID`, `AZURE_TENANT_ID` och `AZURE_SUBSCRIPTION_ID` från GitHub Secrets, men behöver ingen långlivad client secret.
 
-### Resurser som definieras
-
-Bicep-konfigurationen beskriver bland annat:
-
-- Azure Storage Account
-- Blob Storage-container
-- Azure Container Registry
-- Azure Container Apps Environment
-- Azure Container App
-- Managed Identity
-- RBAC-rolltilldelningar
-
-### Parametrisering
-
-Resursnamn och andra miljöberoende värden ligger i parameterfilerna. Det gör det möjligt att använda samma grundläggande Bicep-template för olika miljöer.
-
-Exempel på parametrar är:
-
-- Storage Account-namn
-- ACR-namn
-- Document Intelligence-endpoint
-
-### Validering
-
-Bicep-filerna har byggts och kontrollerats med Azure CLI.
-
-`az deployment group what-if` användes för att se vilka förändringar en deployment skulle göra innan resurser ändrades.
-
-Det gör det möjligt att upptäcka potentiella förändringar i infrastrukturen innan en faktisk deployment genomförs.
-## 6. Säkerhet och secrets
-
-Scanly använder Azure Managed Identity, RBAC och Azure Container Apps Secrets för att undvika att känsliga credentials behöver lagras i källkoden.
-
-### Managed Identity och RBAC
-
-Container Appen använder en System Assigned Managed Identity.
-
-Identiteten används för åtkomst till Azure Container Registry och Azure Blob Storage.
-
-Följande roller används:
-
-- `AcrPull` – för att hämta containerimagen från ACR.
-- `Storage Blob Data Contributor` – för att skriva fakturornas JSON-resultat till Blob Storage.
-
-### Document Intelligence API-key
-
-Document Intelligence använder API-key eftersom den delade Document Intelligence-resursen ligger i en annan tenant.
-
-API-nyckeln lagras som en **Container Apps Secret** och refereras av applikationen genom miljövariabeln:
-
-`AZURE_DI_KEY`
-
-Document Intelligence-endpointen konfigureras genom:
-
-`AZURE_DI_ENDPOINT`
-
-API-nyckeln ligger därför inte direkt i källkoden eller i GitHub-repositoryt.
-
-### Miljövariabler
-
-Konfigurationsvärden som varierar mellan miljöer hanteras genom miljövariabler och Bicep-parameterfiler istället för att hårdkodas i applikationen.
+Document Intelligence hanteras separat eftersom den delade kursresursen ligger i en annan tenant. Om `AZURE_DI_KEY` används ska den behandlas som en hemlighet. Om en hemlig nyckel av misstag hamnar i Git-historiken räcker det inte att ta bort den i en ny commit: nyckeln ska omedelbart roteras eller spärras, och historiken ska saneras vid behov.
 
 ## 7. CI/CD och deployment
 
-Projektet använder GitHub Actions för att automatisera build, test och deployment.
-
-När ändringar pushas till repositoryts `main`-branch körs workflowet och hanterar deploymentkedjan.
+Projektet använder GitHub Actions för att automatisera build, test och deployment. Workflowet triggas automatiskt vid push till `main`.
 
 ### Deploymentflöde
 
-1. Kod pushas till GitHub.
-2. GitHub Actions bygger och testar applikationen.
-3. Docker-imagen byggs.
-4. Imagen pushas till Azure Container Registry.
-5. Azure Container Apps uppdateras med den nya imagen.
-6. API:t startar med den nya versionen.
-7. En health check används för att kontrollera att applikationen är tillgänglig.
+1. Koden checkas ut från GitHub.
+2. .NET 8 installeras.
+3. `dotnet restore` körs.
+4. `dotnet build` körs.
+5. xUnit-testprojektet `Scanly.Tests` körs.
+6. GitHub Actions loggar in mot Azure med OIDC.
+7. Docker-imagen byggs och taggas med Git commit SHA samt `latest`.
+8. Imagen pushas till Azure Container Registry.
+9. Azure Container Apps uppdateras med den SHA-taggade imagen.
+10. Workflowet hämtar Container Appens publika FQDN och anropar `/health`.
 
-På detta sätt behöver deployment inte göras manuellt varje gång en ny version av applikationen ska publiceras.
+Om restore, build eller test misslyckas stoppas workflowet och någon ny version deployas inte. En deployment betraktas som verifierad först när den publika health-kontrollen lyckas. En verifierad körning har returnerat `{"status":"ok","mode":"azure"}`.
 
-### Containerisering
+### Rollback
 
-API:t körs som en Docker-container.
+Azure Container Apps revisionsfunktion har testats för rollback. En tidigare fungerande revision användes som källa till en rollback-revision, och den återställda revisionen fick 100 procent av trafiken. Därefter verifierades API:t på nytt via `/health`.
 
-Docker-imagen innehåller applikationen och dess runtime så att samma applikation kan köras lokalt och i Azure Container Apps.
+## 8. Teknisk reflektion och designval
 
-## 8. Designval och begränsningar
+### 8.1 Varför Container Apps och inte AKS?
 
-### Designval
+Container Apps passar Scanly eftersom lösningen består av ett containeriserat API som behöver ingress, revisionshantering och autoskalning utan att teamet samtidigt behöver administrera ett Kubernetes-kluster. Det ger mindre operativ komplexitet och är rimligt för ett mindre SaaS-system med en begränsad mängd tjänster. Nackdelen är att teamet får mindre direkt kontroll över noder, nätverk och Kubernetes-resurser än i AKS. AKS skulle bli mer relevant om Scanly utvecklas till många mikrotjänster med mer avancerade nätverkskrav, service mesh, specialiserade workloads eller behov av detaljerad klusterstyrning. För den nuvarande lösningen skulle den extra driftbördan i AKS inte ge tillräcklig nytta.
 
-Lösningen är uppdelad mellan flera Azure-tjänster där varje tjänst har ett tydligt ansvar.
+### 8.2 CI/CD – från git push till live app
 
-- Container Apps kör själva API:t.
-- Document Intelligence ansvarar för fakturaanalysen.
-- Blob Storage används för lagring av resultat.
-- ACR används för containerimages.
-- Bicep används för Infrastructure as Code.
-- GitHub Actions används för CI/CD.
+En push till `main` triggar GitHub Actions automatiskt. Pipelineflödet genomför restore, build och xUnit-test innan någon Docker-image får publiceras. Efter godkänt test autentiserar workflowet mot Azure med OIDC, bygger imagen, pushar den till ACR och deployar den till Container Apps. Sist anropas den publika `/health`-endpointen för att verifiera att den nya versionen faktiskt är live. Om ett tidigt steg misslyckas stoppas kedjan och den befintliga live-versionen påverkas inte av en ny deployment.
 
-Denna uppdelning gör att de olika delarna kan utvecklas och hanteras separat.
+### 8.3 Varför Bicep och vad betyder idempotens?
 
-### Begränsningar
+Bicep används för att göra infrastrukturen reproducerbar, versionshanterad och möjlig att granska tillsammans med applikationskoden. I stället för att manuellt klicka fram varje resurs beskriver mallen vilket slutläge Azure-miljön ska ha. Idempotens innebär att samma deklarativa konfiguration kan köras flera gånger och fortfarande sträva efter samma slutläge i stället för att skapa nya dubbletter varje gång. Det minskar risken för konfigurationsskillnader mellan miljöer och gör ändringar lättare att granska innan de genomförs. What-if används som ytterligare kontroll för att se vilka resurser som kommer att ändras.
 
-Document Intelligence är en delad kursresurs som ligger i en annan tenant. Därför kan Managed Identity inte användas för autentisering mot den resursen. API-key används istället och lagras säkert som en Container Apps Secret.
+### 8.4 Säkerhet och credentials
 
-Lösningen är främst byggd för kursprojektets behov och använder därför en relativt enkel arkitektur. Vid en större produktionsmiljö skulle ytterligare funktioner kunna behövas, exempelvis mer omfattande övervakning, loggning och backupstrategier.
+Managed Identity och RBAC används för ACR och Blob Storage så att applikationen inte behöver lagra dessa tjänsters credentials. GitHub Actions använder OIDC i stället för en långlivad client secret. För Document Intelligence kan den nuvarande implementationen använda API-key när den delade kursresursens tenant gör Managed Identity opraktiskt; nyckeln ska då ligga utanför källkoden och hanteras som en secret. Om en credential råkar committas ska den betraktas som komprometterad och roteras omedelbart även om commiten senare tas bort. Därefter bör Git-historiken saneras vid behov och åtkomstloggar kontrolleras.
+
+## 9. Ekonomi
+
+Kostnadsanalysen är gjord i Azure Pricing Calculator med region Sweden Central och SEK som valuta. Beräkningen använder Scanlys scenario med 30 kunder och cirka 15 000 fakturor per månad vid lansering. Antagandet är i genomsnitt en analyserad sida per faktura.
+
+### 9.1 Lansering – 30 kunder / cirka 15 000 fakturor per månad
+
+| Resurs | Antagande | Månadskostnad |
+|---|---|---:|
+| Azure Container Apps | Consumption, 2 min-repliker, 1 vCPU och 2 GiB per replik | 450,30 kr |
+| Azure Container Registry | Basic, 1 register | 47,58 kr |
+| Azure Blob Storage | Standard LRS, Hot, cirka 1 GB och uppskattade operationer | 0,99 kr |
+| Azure Document Intelligence | S0, prebuilt-invoice, 15 × 1 000 sidor | 1 427,88 kr |
+| **Totalt** |  | **1 926,75 kr/mån** |
+
+Beräknad årskostnad är **23 120,96 kr**. Vid 15 000 fakturor per månad blir den uppskattade Azure-kostnaden cirka **0,13 kr per faktura**.
+
+### 9.2 Tredubblad kundbas – 90 kunder / cirka 45 000 fakturor per månad
+
+| Resurs | Antagande | Månadskostnad |
+|---|---|---:|
+| Azure Container Apps | Samma min-kapacitet; 45 000 requests ligger fortfarande inom kalkylens fria request/aktiva kvot | 450,30 kr |
+| Azure Container Registry | Basic, 1 register | 47,58 kr |
+| Azure Blob Storage | cirka 3 GB, 45 000 skrivningar och 45 000 läsningar | cirka 2,98 kr |
+| Azure Document Intelligence | S0, prebuilt-invoice, 45 × 1 000 sidor | 4 283,64 kr |
+| **Totalt** |  | **4 784,49 kr/mån** |
+
+Beräknad årskostnad är **57 413,94 kr**. Vid 45 000 fakturor per månad blir kostnaden cirka **0,11 kr per faktura**. Totalkostnaden ökar alltså tydligt när användningen växer, men kostnaden per faktura sjunker eftersom ACR och den konfigurerade Container Apps-grundkapaciteten inte tredubblas i samma takt.
+
+### 9.3 Dyraste resursen
+
+Azure Document Intelligence är den största kostnadsdrivaren. Vid lansering står tjänsten för 1 427,88 kr av totalt 1 926,75 kr per månad, och vid tredubblad kundbas stiger den till 4 283,64 kr per månad. Kostnaden följer antalet analyserade sidor betydligt mer direkt än ACR och den grundkapacitet som hålls igång i Container Apps. Därför är Document Intelligence den viktigaste resursen att följa ur kostnadsperspektiv.
+
+### 9.4 Flaskhals vid fyrdubblad trafik
+
+Vid ungefär fyra gånger lanseringstrafiken skulle Scanly hantera omkring 60 000 fakturor per månad. Container Apps kan skala från 2 till maximalt 5 repliker, vilket sätter ett konfigurerat tak för hur mycket API-lagret kan skala ut utan en ändring i infrastrukturen. Samtidigt väntar `POST /invoices` synkront på Document Intelligence innan requesten slutförs, vilket gör AI-tjänstens svarstid, genomströmning och eventuella quota viktiga vid trafiktoppar. Den första praktiska flaskhalsen kan därför uppstå i kombinationen Document Intelligence och det synkrona requestflödet snarare än i Blob Storage. Vid fortsatt tillväxt bör lösningen belastningstestas och vid behov utvecklas mot asynkron fakturabehandling med kö, tillsammans med justerad `maxReplicas` och övervakning.
+
+## 10. Begränsningar och nästa steg
+
+Den nuvarande lösningen är byggd för kursprojektets omfattning. Full produktionssättning skulle kräva ytterligare arbete med bland annat slutanvändarautentisering, rate limiting, central övervakning och larm, kostnadsbudgetar samt en mer komplett disaster recovery-plan.
+
+Document Intelligence-autentiseringen är dessutom beroende av hur den delade kursresursen är placerad i förhållande till Container Appens tenant. Målet bör vara Managed Identity utan nyckelfallback när rätt Azure-resurs och RBAC kan användas.
+
+Dev/prod-parameterfilerna bör före en helt parameterstyrd deployment även innehålla eller få tillfört det Document Intelligence-endpointvärde som `main.bicep` kräver.
