@@ -36,13 +36,25 @@ var logger = app.Logger;
 // Azure-klienter — aktiveras automatiskt när miljövariablerna är satta
 DocumentAnalysisClient? diClient = null;
 BlobContainerClient? blobs = null;
+
 if (azureMode)
 {
     var azureCredential = new DefaultAzureCredential();
 
-    diClient = new DocumentAnalysisClient(
-        new Uri(diEndpoint!),
-        azureCredential);
+    var diKey = Environment.GetEnvironmentVariable("AZURE_DI_KEY");
+
+    if (!string.IsNullOrWhiteSpace(diKey))
+    {
+        diClient = new DocumentAnalysisClient(
+            new Uri(diEndpoint!),
+            new AzureKeyCredential(diKey));
+    }
+    else
+    {
+        diClient = new DocumentAnalysisClient(
+            new Uri(diEndpoint!),
+            azureCredential);
+    }
 
     blobs = new BlobServiceClient(
         new Uri(storageUrl!),
