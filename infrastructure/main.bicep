@@ -1,13 +1,56 @@
+
+@description('Name of the Azure Storage Account')
 param storageAccountName string
+
+@description('Name of the Azure Container Registry')
 param acrName string
+
+@description('Document Intelligence endpoint')
 param documentIntelligenceEndpoint string
 
+@description('Container App name')
+param containerAppName string
 
+@description('Container Apps Environment name')
+param containerAppsEnvironmentName string
+
+@description('Minimum number of replicas')
+@minValue(1)
+param minReplicas int
+
+@description('Maximum number of replicas')
+@minValue(1)
+param maxReplicas int
+
+@description('Azure Container Registry SKU')
+@allowed([
+  'Basic'
+  'Standard'
+  'Premium'
+])
+param acrSku string
+
+@description('Storage Account SKU')
+@allowed([
+  'Standard_LRS'
+  'Standard_GRS'
+  'Standard_ZRS'
+])
+param storageSku string
+
+@description('Document Intelligence API key. Supply securely at deployment time.')
+@secure()
+param documentIntelligenceKey string
+
+@description('Container image tag')
+param imageTag string = 'latest'
+
+// Storage Account
 resource storageAccount 'Microsoft.Storage/storageAccounts@2023-05-01' = {
   name: storageAccountName
   location: resourceGroup().location
   sku: {
-    name: 'Standard_LRS'
+    name: storageSku
   }
   kind: 'StorageV2'
   properties: {
@@ -15,6 +58,7 @@ resource storageAccount 'Microsoft.Storage/storageAccounts@2023-05-01' = {
   }
 }
 
+// Private Blob container
 resource invoicesContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = {
   name: '${storageAccount.name}/default/invoices'
   properties: {
@@ -22,25 +66,28 @@ resource invoicesContainer 'Microsoft.Storage/storageAccounts/blobServices/conta
   }
 }
 
+// Azure Container Registry
 resource acr 'Microsoft.ContainerRegistry/registries@2023-07-01' = {
   name: acrName
   location: resourceGroup().location
   sku: {
-    name: 'Basic'
+    name: acrSku
   }
   properties: {
     adminUserEnabled: false
   }
 }
 
+// Container Apps Environment
 resource containerAppsEnvironment 'Microsoft.App/managedEnvironments@2024-03-01' = {
-  name: 'scanly-env'
+  name: containerAppsEnvironmentName
   location: resourceGroup().location
   properties: {}
 }
 
+// Scanly API
 resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
-  name: 'scanly-api'
+  name: containerAppName
   location: resourceGroup().location
 
   identity: {
@@ -63,13 +110,20 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
           identity: 'system'
         }
       ]
+
+      secrets: [
+        {
+          name: 'azure-di-key'
+          value: documentIntelligenceKey
+        }
+      ]
     }
 
     template: {
       containers: [
         {
           name: 'scanly-api'
-          image: '${acr.name}.azurecr.io/scanly-api:latest'
+          image: '${acr.name}.azurecr.io/scanly-api:${imageTag}'
 
           env: [
             {
@@ -77,8 +131,12 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
               value: documentIntelligenceEndpoint
             }
             {
+              name: 'AZURE_DI_KEY'
+              secretRef: 'azure-di-key'
+            }
+            {
               name: 'AZURE_STORAGE_URL'
-              value: 'https://${storageAccount.name}.${environment().suffixes.storage}/'
+              value: 'https://${storageAccount.name}.blob.${environment().suffixes.storage}/'
             }
           ]
 
@@ -86,12 +144,48 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
             cpu: 1
             memory: '2Gi'
           }
+
+          probes: [
+            {
+              type: 'Liveness'
+              tcpSocket: {
+                port: 8080
+              }
+              initialDelaySeconds: 0
+              periodSeconds: 10
+              timeoutSeconds: 5
+              failureThreshold: 3
+              successThreshold: 1
+            }
+            {
+              type: 'Readiness'
+              tcpSocket: {
+                port: 8080
+              }
+              initialDelaySeconds: 0
+              periodSeconds: 5
+              timeoutSeconds: 5
+              failureThreshold: 48
+              successThreshold: 1
+            }
+            {
+              type: 'Startup'
+              tcpSocket: {
+                port: 8080
+              }
+              initialDelaySeconds: 1
+              periodSeconds: 1
+              timeoutSeconds: 3
+              failureThreshold: 240
+              successThreshold: 1
+            }
+          ]
         }
       ]
 
       scale: {
-        minReplicas: 2
-        maxReplicas: 5
+        minReplicas: minReplicas
+        maxReplicas: maxReplicas
 
         rules: [
           {
@@ -108,9 +202,15 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
   }
 }
 
+// ACR Pull permission
+
 resource acrPullRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(acr.id, containerApp.id, 'AcrPull')
+  name: containerAppName == 'scanly-api'
+    ? '1488a37c-20b3-4412-a7b6-b4a5b8937e7a'
+    : guid(acr.id, containerAppName, 'AcrPull')
+
   scope: acr
+
   properties: {
     roleDefinitionId: subscriptionResourceId(
       'Microsoft.Authorization/roleDefinitions',
@@ -121,9 +221,15 @@ resource acrPullRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-
   }
 }
 
+// Blob Storage permission
+
 resource storageBlobDataContributorRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(storageAccount.id, containerApp.id, 'StorageBlobDataContributor')
+  name: containerAppName == 'scanly-api'
+    ? '5d91956d-b5fd-46d8-95fc-9a4410c2373f'
+    : guid(storageAccount.id, containerAppName, 'StorageBlobDataContributor')
+
   scope: storageAccount
+
   properties: {
     roleDefinitionId: subscriptionResourceId(
       'Microsoft.Authorization/roleDefinitions',
@@ -134,5 +240,8 @@ resource storageBlobDataContributorRoleAssignment 'Microsoft.Authorization/roleA
   }
 }
 
-output storageUrl string = 'https://${storageAccount.name}.${environment().suffixes.storage}/'
-output containerAppName string = containerApp.name
+
+
+// Outputs
+output storageUrl string = 'https://${storageAccount.name}.blob.${environment().suffixes.storage}/'
+output containerAppNameOutput string = containerApp.name
